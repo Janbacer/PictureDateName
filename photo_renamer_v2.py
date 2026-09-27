@@ -3,7 +3,7 @@ Photo & Video Date Renamer
 Rename images and videos by a date you choose (EXIF, video metadata,
 filename, modified or created date), with a live preview and undo.
 
-Requirements:  pip install pillow hachoir
+Requirements:  pip install pillow hachoir pywin32
 """
 import os
 import re
@@ -21,20 +21,32 @@ try:
 except ImportError:
     HAS_HACHOIR = False
 
+try:  # read dates exactly as Windows Explorer shows them (Windows only)
+    import pythoncom
+    from win32com.propsys import propsys, pscon
+    HAS_WINPROPS = True
+except ImportError:
+    HAS_WINPROPS = False
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".gif", ".heic", ".webp"}
-VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".mts", ".m2ts", ".3gp"}
+VIDEO_EXTS = {".mp4", ".mpg", ".mpeg", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".mts", ".m2ts", ".3gp"}
 ALL_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
 # key -> label shown in the UI
 SOURCES = {
+    "apple": "iPhone capture date (videos)",
     "exif": "EXIF date taken (photos)",
     "video": "Video metadata date",
+    "media": "Windows: Media created / Date taken",
     "filename": "Date in filename (e.g. WhatsApp)",
     "modified": "File modified date",
     "created": "File created date",
 }
-DEFAULT_ORDER = ["exif", "video", "filename", "modified", "created"]
-DEFAULT_ON = {"exif": True, "video": True, "filename": True, "modified": False, "created": False}
+# Most reliable first. Modified comes before created because copying a file
+# keeps its modified date but resets its created date to the copy time.
+DEFAULT_ORDER = ["apple", "media", "exif", "video", "filename", "modified", "created"]
+CUTOFF = datetime(2000, 1, 1)
+DEFAULT_ON = {"apple": True, "media": True, "exif": True, "video": True, "filename": True, "modified": False, "created": False}
 
 DATE_FORMATS = [
     "%Y%m%d_%H%M%S",
@@ -84,6 +96,105 @@ def read_video(path):
     return None
 
 
+# ---- Apple QuickTime capture date (iPhone .mov / .mp4)
+def _atoms(f, start, end):
+    """Yield (type, data_start, data_end) for atoms between start and end."""
+    pos = start
+    while pos + 8 <= end:
+        f.seek(pos)
+        head = f.read(8)
+        if len(head) < 8:
+            return
+        size = int.from_bytes(head[:4], "big")
+        kind = head[4:8]
+        hdr = 8
+        if size == 1:
+            size = int.from_bytes(f.read(8), "big")
+            hdr = 16
+        elif size == 0:
+            size = end - pos
+        if size < hdr:
+            return
+        yield kind, pos + hdr, min(pos + size, end)
+        pos += size
+
+
+def read_apple_date(path):
+    """com.apple.quicktime.creationdate: real capture time incl. time zone."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            file_end = f.tell()
+            moov = next(((s, e) for k, s, e in _atoms(f, 0, file_end) if k == b"moov"), None)
+            if not moov:
+                return None
+            metas = []
+            for k, s, e in _atoms(f, *moov):
+                if k == b"meta":
+                    metas.append((s, e))
+                elif k == b"udta":
+                    metas += [(s2, e2) for k2, s2, e2 in _atoms(f, s, e) if k2 == b"meta"]
+            for s, e in metas:
+                f.seek(s)
+                if f.read(4) == b"\0\0\0\0":  # MP4-style meta has version/flags
+                    s += 4
+                children = {k: (cs, ce) for k, cs, ce in _atoms(f, s, e)}
+                if b"keys" not in children or b"ilst" not in children:
+                    continue
+                ks, ke = children[b"keys"]
+                f.seek(ks + 4)
+                count = int.from_bytes(f.read(4), "big")
+                keys = {}
+                for i in range(1, count + 1):
+                    size = int.from_bytes(f.read(4), "big")
+                    f.read(4)  # namespace
+                    keys[i] = f.read(max(size - 8, 0)).decode("utf-8", "ignore")
+                for k, cs, ce in _atoms(f, *children[b"ilst"]):
+                    if keys.get(int.from_bytes(k, "big")) != "com.apple.quicktime.creationdate":
+                        continue
+                    for k2, ds, de in _atoms(f, cs, ce):
+                        if k2 == b"data":
+                            f.seek(ds + 8)  # skip type + locale
+                            text = f.read(de - ds - 8).decode("utf-8", "ignore").strip()
+                            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+                                try:
+                                    return datetime.strptime(text, fmt)
+                                except ValueError:
+                                    pass
+    except Exception:
+        pass
+    return None
+
+
+def read_windows_date(path):
+    """Explorer's 'Media created' (videos) or 'Date taken' (photos), as aware UTC."""
+    if not HAS_WINPROPS:
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    key = pscon.PKEY_Media_DateEncoded if ext in VIDEO_EXTS else pscon.PKEY_Photo_DateTaken
+    try:
+        store = propsys.SHGetPropertyStoreFromParsingName(os.path.abspath(path))
+        value = store.GetValue(key).GetValue()
+        if not value:
+            return None
+        dt = datetime(value.year, value.month, value.day, value.hour, value.minute, value.second)
+        return dt.replace(tzinfo=timezone.utc)  # Windows stores these in UTC
+    except Exception:
+        return None
+
+
+def read_media_created(path):
+    dt = read_windows_date(path)
+    if dt:
+        return dt
+    ext = os.path.splitext(path)[1].lower()
+    if ext in IMAGE_EXTS:
+        return read_exif(path)
+    if ext in VIDEO_EXTS:
+        return read_video(path)
+    return None
+
+
 FILENAME_PATTERNS = [
     # 20251026_143012 / 2025-10-26 14.30.12 / 20251026-143012
     re.compile(r"(?<!\d)((?:19|20)\d{2})[-_.]?(\d{2})[-_.]?(\d{2})[ _T-]?(\d{2})[-_.:]?(\d{2})[-_.:]?(\d{2})(?:\d{1,3})?(?!\d)"),
@@ -92,15 +203,20 @@ FILENAME_PATTERNS = [
 ]
 
 
-def read_filename(path):
+def read_filename_full(path):
+    """Return (datetime, has_time) or (None, False)."""
     name = os.path.splitext(os.path.basename(path))[0]
-    for pat in FILENAME_PATTERNS:
+    for i, pat in enumerate(FILENAME_PATTERNS):
         for m in pat.finditer(name):
             try:
-                return datetime(*map(int, m.groups()))
+                return datetime(*map(int, m.groups())), i == 0
             except ValueError:
                 continue
-    return None
+    return None, False
+
+
+def read_filename(path):
+    return read_filename_full(path)[0]
 
 
 def read_modified(path):
@@ -113,6 +229,8 @@ def read_created(path):
 
 
 READERS = {
+    "apple": read_apple_date,
+    "media": read_media_created,
     "exif": read_exif,
     "video": read_video,
     "filename": read_filename,
@@ -127,9 +245,10 @@ def read_all_dates(path):
     for key, fn in READERS.items():
         if key == "exif" and ext not in IMAGE_EXTS:
             continue
-        if key == "video" and ext not in VIDEO_EXTS:
+        if key in ("video", "apple") and ext not in VIDEO_EXTS:
             continue
         dates[key] = fn(path)
+    dates["filename_has_time"] = read_filename_full(path)[1]
     return dates
 
 
@@ -170,16 +289,19 @@ class RenamerApp(tk.Tk):
         self.vid_prefix = tk.StringVar(value="VID_")
         self.date_fmt = tk.StringVar(value=DATE_FORMATS[0])
         self.video_local = tk.BooleanVar(value=True)
+        self.earliest_after_2000 = tk.BooleanVar(value=False)
         self.recursive = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Add files or a folder to get started.")
 
         self._style()
         self._build()
         self._apply_tree_colors()
-        for var in (self.img_prefix, self.vid_prefix, self.date_fmt, self.video_local):
+        for var in (self.img_prefix, self.vid_prefix, self.date_fmt, self.video_local,
+                self.earliest_after_2000):
             var.trace_add("write", lambda *_: self.refresh_preview())
         for var in self.enabled.values():
             var.trace_add("write", lambda *_: self.refresh_preview())
+        self.refresh_preview()
 
     # ---------- look
     def _style(self):
@@ -275,13 +397,18 @@ class RenamerApp(tk.Tk):
         side.pack(side="left", fill="y")
 
         ttk.Label(side, text="1. Date source", style="H.TLabel").pack(anchor="w")
-        ttk.Label(side, text="Tried from top to bottom. First one found wins.",
-                  style="Hint.TLabel").pack(anchor="w", pady=(0, 6))
+        self.mode_hint = ttk.Label(side, style="Hint.TLabel")
+        self.mode_hint.pack(anchor="w", pady=(0, 6))
         self.src_frame = ttk.Frame(side, style="Card.TFrame")
         self.src_frame.pack(fill="x")
         self._draw_sources()
         ttk.Checkbutton(side, text="Convert video time from UTC to local",
                         variable=self.video_local, style="Card.TCheckbutton").pack(anchor="w", pady=(6, 0))
+        ttk.Checkbutton(side, text="Use earliest checked date (2000 to today)",
+                variable=self.earliest_after_2000, style="Card.TCheckbutton").pack(anchor="w")
+        if not HAS_WINPROPS:
+            ttk.Label(side, text="pywin32 not installed: Windows dates use fallback readers",
+                      style="Hint.TLabel", foreground="#f87171").pack(anchor="w")
         if not HAS_HACHOIR:
             ttk.Label(side, text="hachoir not installed: video metadata disabled",
                       style="Hint.TLabel", foreground="#f87171").pack(anchor="w")
@@ -384,6 +511,8 @@ class RenamerApp(tk.Tk):
         self.rename_btn.configure(state="disabled")
 
         def work():
+            if HAS_WINPROPS:
+                pythoncom.CoInitialize()  # COM must be set up in each thread
             for i, p in enumerate(new, 1):
                 self.dates[p] = read_all_dates(p)
                 if i % 10 == 0 or i == len(new):
@@ -394,19 +523,56 @@ class RenamerApp(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     # ---------- preview
+    def _get_date(self, path, key):
+        """Date from one source, as naive local time, or None."""
+        dt = self.dates.get(path, {}).get(key)
+        if not isinstance(dt, datetime):
+            return None
+        if dt.tzinfo is not None:
+            # time zone is known (e.g. from Windows): convert to local time
+            return dt.astimezone().replace(tzinfo=None)
+        is_video_date = key == "video" or (
+            key == "media" and os.path.splitext(path)[1].lower() in VIDEO_EXTS)
+        if is_video_date and self.video_local.get():
+            dt = utc_to_local(dt)
+        return dt
+
     def pick_date(self, path):
-        for key in self.order:
-            if not self.enabled[key].get():
-                continue
-            dt = self.dates.get(path, {}).get(key)
-            if dt:
-                if key == "video" and self.video_local.get():
-                    dt = utc_to_local(dt)
-                return dt, key
-        return None, None
+        active = [k for k in self.order if self.enabled[k].get()]
+
+        if not self.earliest_after_2000.get():
+            # priority mode: first checked source that has a date wins
+            for key in active:
+                dt = self._get_date(path, key)
+                if dt:
+                    return dt, key
+            return None, None
+
+        # earliest mode: among all checked sources, take the earliest date
+        # between 2000-01-01 and now (drops 1970/1980 reset dates and future dates)
+        now = datetime.now()
+        candidates = []
+        for key in active:
+            dt = self._get_date(path, key)
+            if dt and CUTOFF <= dt <= now:
+                candidates.append((dt, key))
+        if not candidates:
+            return None, None
+        dt, key = min(candidates, key=lambda c: c[0])
+
+        # a date-only filename (e.g. WhatsApp) reads as 00:00:00 and would always
+        # "win" that day; if another source has the same day with a real time, use it
+        if key == "filename" and not self.dates[path].get("filename_has_time"):
+            same_day = [c for c in candidates if c[1] != "filename" and c[0].date() == dt.date()]
+            if same_day:
+                dt, key = min(same_day, key=lambda c: c[0])
+        return dt, key
 
     def refresh_preview(self):
         self._update_example()
+        self.mode_hint.configure(
+            text="Earliest date among the checked sources wins." if self.earliest_after_2000.get()
+            else "Tried from top to bottom. First one found wins.")
         self.tree.delete(*self.tree.get_children())
         self.plan = []
         taken = set()
@@ -498,7 +664,7 @@ class RenamerApp(tk.Tk):
         # modified/created dates stay valid; filename date must be re-read
         for p in mapping.values():
             if p in self.dates:
-                self.dates[p]["filename"] = read_filename(p)
+                self.dates[p]["filename"], self.dates[p]["filename_has_time"] = read_filename_full(p)
         self.refresh_preview()
 
 
